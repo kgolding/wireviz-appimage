@@ -84,7 +84,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq python3 python3-venv graphviz wget
+          sudo apt-get install -y -qq graphviz wget curl jq
           # appimagetool needs FUSE; GitHub-hosted runners often lack it.
           # Install if available; build-appimage.sh falls back to
           # --appimage-extract-and-run if this isn't present.

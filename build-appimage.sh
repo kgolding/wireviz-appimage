@@ -4,8 +4,15 @@
 # as a self-contained AppImage.
 #
 # WireViz is a pure-Python CLI tool, so this script:
-#   1. Builds an AppDir with an embedded, relocatable Python venv
-#   2. pip-installs wireviz (and its Python deps) into that venv
+#   1. Downloads a portable, relocatable CPython build (from
+#      astral-sh/python-build-standalone — the same builds `uv`/`rye`
+#      use) rather than relying on the OS's system Python. Distro
+#      Python packages (apt/dnf) bake an absolute /usr prefix into the
+#      interpreter at compile time, which breaks the moment the
+#      AppImage runs on a machine without that exact Python version at
+#      that exact path — this is what caused the earlier
+#      "ModuleNotFoundError: No module named 'encodings'" failure.
+#   2. pip-installs wireviz (and its Python deps) into that interpreter
 #   3. Bundles a static/portable Graphviz `dot` binary (wireviz's one
 #      external, non-Python dependency) so the AppImage works even on
 #      systems without Graphviz installed
@@ -13,10 +20,12 @@
 #   5. Downloads appimagetool and runs it to produce the final .AppImage
 #
 # Requirements to RUN this script: a Linux x86_64 machine, internet
-# access, `python3`, `python3-venv`, and `wget`/`curl`. It does NOT
-# need Graphviz pre-installed on the build machine (we vendor it),
-# but if system Graphviz is missing the script will fall back to
-# apt-get to fetch just the `dot` binary for bundling.
+# access, and `curl`/`wget`/`tar`/`jq`. A local Python installation is
+# NOT required — the interpreter is downloaded fresh so the result is
+# reproducible regardless of what's on the build machine. It does NOT
+# need Graphviz pre-installed either (we vendor it), but if system
+# Graphviz is missing the script will fall back to apt-get to fetch
+# just the `dot` binary for bundling.
 #
 # Usage:
 #   chmod +x build-appimage.sh
@@ -28,38 +37,53 @@
 set -euo pipefail
 
 WIREVIZ_VERSION="${1:-0.4.1}"          # pip version to install; override as needed
+PYTHON_VERSION="${PYTHON_VERSION:-3.11}"  # portable interpreter minor version
 APP=WireViz
 BUILD_DIR="$(pwd)/build"
 APPDIR="${BUILD_DIR}/${APP}.AppDir"
 ARCH="x86_64"
 
-echo "==> Building ${APP} AppImage (wireviz==${WIREVIZ_VERSION})"
+echo "==> Building ${APP} AppImage (wireviz==${WIREVIZ_VERSION}, python ${PYTHON_VERSION})"
 
 rm -rf "${BUILD_DIR}"
 mkdir -p "${APPDIR}/usr/bin" "${APPDIR}/usr/lib" "${APPDIR}/usr/share/applications" \
          "${APPDIR}/usr/share/icons/hicolor/256x256/apps"
 
 # ---------------------------------------------------------------------------
-# 1. Embedded Python venv with WireViz installed
+# 1. Portable, relocatable Python interpreter + WireViz installed into it
 # ---------------------------------------------------------------------------
-echo "==> Creating embedded venv"
-# --copies: copy the actual python interpreter binary into the venv
-# instead of symlinking to the build machine's system python. Without
-# this, the AppImage silently depends on the *target* machine having a
-# python3 at the exact same absolute path the venv was built with.
-python3 -m venv --copies "${APPDIR}/usr/venv"
-# shellcheck disable=SC1091
-source "${APPDIR}/usr/venv/bin/activate"
-pip install --upgrade pip wheel >/dev/null
-pip install "wireviz==${WIREVIZ_VERSION}"
-deactivate
+echo "==> Fetching portable Python ${PYTHON_VERSION} (python-build-standalone)"
+PBS_ASSET_URL="$(curl -fsSL \
+  https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest \
+  | jq -r --arg ver "$PYTHON_VERSION" \
+    '.assets[].browser_download_url
+     | select(test("cpython-" + $ver + "\\.[0-9]+\\+[0-9]+-x86_64-unknown-linux-gnu-install_only\\.tar\\.gz$"))' \
+  | head -n1)"
 
-# NOTE: do NOT rewrite the shebang lines in usr/venv/bin/* to
-# `#!/usr/bin/env python3` — that makes them run against the *host*
-# system's Python (which doesn't have wireviz installed) instead of
-# this bundled venv. The venv's own interpreter is invoked directly
-# and explicitly in AppRun below, so the shebang line is never even
-# used at runtime; leave it as-is.
+if [ -z "${PBS_ASSET_URL}" ]; then
+  echo "Could not find a python-build-standalone release for Python ${PYTHON_VERSION}" >&2
+  exit 1
+fi
+echo "    using ${PBS_ASSET_URL}"
+
+curl -fsSL "${PBS_ASSET_URL}" -o /tmp/pbs-python.tar.gz
+tar -xzf /tmp/pbs-python.tar.gz -C "${APPDIR}/usr"
+mv "${APPDIR}/usr/python" "${APPDIR}/usr/pyruntime"
+rm -f /tmp/pbs-python.tar.gz
+
+PYBIN="${APPDIR}/usr/pyruntime/bin/python3"
+
+# These builds don't always ship pip preinstalled; ensure it's there.
+"${PYBIN}" -m ensurepip --upgrade >/dev/null 2>&1 || true
+"${PYBIN}" -m pip install --upgrade pip wheel >/dev/null
+"${PYBIN}" -m pip install "wireviz==${WIREVIZ_VERSION}"
+
+# NOTE: do NOT rewrite shebang lines in usr/pyruntime/bin/* — AppRun
+# invokes the interpreter directly and explicitly (see below), so the
+# shebang recorded by pip at build time is never used at runtime and
+# doesn't matter either way. This whole usr/pyruntime directory is
+# self-contained and relocatable as-is; that's the point of using
+# python-build-standalone instead of the OS's Python.
 
 # ---------------------------------------------------------------------------
 # 2. Bundle a Graphviz `dot` binary (WireViz's only non-Python dependency)
@@ -96,13 +120,15 @@ echo "==> Writing AppRun"
 cat > "${APPDIR}/AppRun" <<'EOF'
 #!/usr/bin/env bash
 HERE="$(dirname "$(readlink -f "${0}")")"
-export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH:-}"
-export PATH="${HERE}/usr/bin:${HERE}/usr/venv/bin:${PATH}"
+# usr/pyruntime/lib holds libpython3.x.so — needed since the portable
+# build links it as a shared library.
+export LD_LIBRARY_PATH="${HERE}/usr/lib:${HERE}/usr/pyruntime/lib:${LD_LIBRARY_PATH:-}"
+export PATH="${HERE}/usr/bin:${HERE}/usr/pyruntime/bin:${PATH}"
 export GVBINDIR="${HERE}/usr/lib/graphviz"
-# Invoke the bundled venv's own interpreter explicitly (not via PATH or
-# the script's shebang) so it always uses the packaged wireviz install,
+# Invoke the bundled interpreter explicitly (not via PATH or the
+# script's shebang) so it always uses the packaged wireviz install,
 # regardless of what Python is or isn't present on the host system.
-exec "${HERE}/usr/venv/bin/python3" "${HERE}/usr/venv/bin/wireviz" "$@"
+exec "${HERE}/usr/pyruntime/bin/python3" "${HERE}/usr/pyruntime/bin/wireviz" "$@"
 EOF
 chmod +x "${APPDIR}/AppRun"
 
@@ -123,7 +149,7 @@ EOF
 cp "${APPDIR}/${APP}.desktop" "${APPDIR}/usr/share/applications/"
 
 # Minimal placeholder icon (replace with a real one if you have it)
-python3 - "${APPDIR}/usr/share/icons/hicolor/256x256/apps/wireviz.png" <<'PY'
+"${PYBIN}" - "${APPDIR}/usr/share/icons/hicolor/256x256/apps/wireviz.png" <<'PY'
 import sys, struct, zlib
 path = sys.argv[1]
 w = h = 256

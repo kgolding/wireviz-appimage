@@ -1,0 +1,124 @@
+name: Build WireViz AppImage
+
+# Watches wireviz/WireViz for new releases and, when one appears that we
+# haven't packaged yet, builds an AppImage and publishes it as a GitHub
+# Release (with the AppImage attached) plus a build artifact.
+
+on:
+  schedule:
+    # Poll upstream once a day. Adjust as you like.
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'WireViz version to build (PyPI version, e.g. 0.4.1). Leave empty to auto-detect the latest upstream release.'
+        required: false
+        default: ''
+  push:
+    branches: [main]
+    paths:
+      - 'build-appimage.sh'
+      - '.github/workflows/build-appimage.yml'
+
+permissions:
+  contents: write   # needed to create releases and upload assets
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+    steps:
+      - name: Resolve target WireViz version
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_VERSION}" ]; then
+            VERSION="${INPUT_VERSION}"
+          else
+            # Ask GitHub for the latest upstream release tag, e.g. "v0.4.1"
+            VERSION="$(curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/wireviz/WireViz/releases/latest \
+              | jq -r '.tag_name' | sed 's/^v//')"
+          fi
+
+          if [ -z "${VERSION}" ] || [ "${VERSION}" = "null" ]; then
+            echo "Could not resolve a WireViz version" >&2
+            exit 1
+          fi
+
+          TAG="wireviz-${VERSION}"
+          echo "Resolved WireViz version: ${VERSION} (release tag: ${TAG})"
+
+          # Skip if we've already published a release for this version,
+          # unless this run was manually triggered (workflow_dispatch),
+          # in which case we always rebuild.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SHOULD_BUILD=true
+          elif gh release view "${TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists, nothing to do."
+            SHOULD_BUILD=false
+          else
+            SHOULD_BUILD=true
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "should_build=${SHOULD_BUILD}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check-version
+    if: needs.check-version.outputs.should_build == 'true'
+    runs-on: ubuntu-22.04   # older base -> more portable bundled glibc
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3 python3-venv graphviz wget
+
+      - name: Build AppImage
+        run: |
+          chmod +x build-appimage.sh
+          ./build-appimage.sh "${{ needs.check-version.outputs.version }}"
+
+      - name: Rename output to release filename
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          SHORT="$(echo "$VERSION" | tr -d '.')"
+          mv build/wireviz-0.41.AppImage "build/wireviz-${SHORT}.AppImage" 2>/dev/null || true
+          ls -la build/
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wireviz-appimage-${{ needs.check-version.outputs.version }}
+          path: build/*.AppImage
+          if-no-files-found: error
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-version.outputs.tag }}
+          name: WireViz ${{ needs.check-version.outputs.version }} (AppImage)
+          body: |
+            Automated AppImage build of [WireViz](https://github.com/wireviz/WireViz) v${{ needs.check-version.outputs.version }}.
+
+            Upstream release: https://github.com/wireviz/WireViz/releases/tag/v${{ needs.check-version.outputs.version }}
+
+            Usage:
+            ```
+            chmod +x wireviz-*.AppImage
+            ./wireviz-*.AppImage path/to/mywire.yml
+            ```
+          files: build/*.AppImage
+          generate_release_notes: false

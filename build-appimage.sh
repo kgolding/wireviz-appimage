@@ -4,13 +4,13 @@
 # as a self-contained AppImage.
 #
 # WireViz is a pure-Python CLI tool, so this script:
-#   1. Downloads a portable, relocatable CPython build (from
-#      astral-sh/python-build-standalone — the same builds `uv`/`rye`
-#      use) rather than relying on the OS's system Python. Distro
-#      Python packages (apt/dnf) bake an absolute /usr prefix into the
-#      interpreter at compile time, which breaks the moment the
-#      AppImage runs on a machine without that exact Python version at
-#      that exact path — this is what caused the earlier
+#   1. Installs `uv` and uses it to download a portable, relocatable
+#      CPython build (uv fetches the same astral-sh/python-build-standalone
+#      builds it uses for `uv python install`) rather than relying on the
+#      OS's system Python. Distro Python packages (apt/dnf) bake an
+#      absolute /usr prefix into the interpreter at compile time, which
+#      breaks the moment the AppImage runs on a machine without that exact
+#      Python version at that exact path — this is what caused the earlier
 #      "ModuleNotFoundError: No module named 'encodings'" failure.
 #   2. pip-installs wireviz (and its Python deps) into that interpreter
 #   3. Bundles a static/portable Graphviz `dot` binary (wireviz's one
@@ -20,12 +20,12 @@
 #   5. Downloads appimagetool and runs it to produce the final .AppImage
 #
 # Requirements to RUN this script: a Linux x86_64 machine, internet
-# access, and `curl`/`wget`/`tar`/`jq`. A local Python installation is
-# NOT required — the interpreter is downloaded fresh so the result is
-# reproducible regardless of what's on the build machine. It does NOT
-# need Graphviz pre-installed either (we vendor it), but if system
-# Graphviz is missing the script will fall back to apt-get to fetch
-# just the `dot` binary for bundling.
+# access, and `curl`/`wget`/`tar`. A local Python installation is NOT
+# required — `uv` and the interpreter it fetches are both downloaded
+# fresh, so the result is reproducible regardless of what's on the
+# build machine. It does NOT need Graphviz pre-installed either (we
+# vendor it), but if system Graphviz is missing the script will fall
+# back to apt-get to fetch just the `dot` binary for bundling.
 #
 # Usage:
 #   chmod +x build-appimage.sh
@@ -52,28 +52,38 @@ mkdir -p "${APPDIR}/usr/bin" "${APPDIR}/usr/lib" "${APPDIR}/usr/share/applicatio
 # ---------------------------------------------------------------------------
 # 1. Portable, relocatable Python interpreter + WireViz installed into it
 # ---------------------------------------------------------------------------
-echo "==> Fetching portable Python ${PYTHON_VERSION} (python-build-standalone)"
-PBS_ASSET_URL="$(curl -fsSL \
-  https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest \
-  | jq -r --arg ver "$PYTHON_VERSION" \
-    '.assets[].browser_download_url
-     | select(test("cpython-" + $ver + "\\.[0-9]+\\+[0-9]+-x86_64-unknown-linux-gnu-install_only\\.tar\\.gz$"))' \
-  | head -n1)"
+# We fetch the interpreter via `uv` (astral-sh/uv) rather than querying the
+# python-build-standalone GitHub API and regex-matching an asset filename
+# ourselves: which exact assets exist for which Python version varies by
+# release date (some dates don't carry every version), which made a
+# hand-rolled lookup fragile. `uv` already solves that reliably since this
+# is exactly its job.
+echo "==> Installing uv (used to fetch a portable Python build)"
+curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
+export PATH="${HOME}/.local/bin:${PATH}"
 
-if [ -z "${PBS_ASSET_URL}" ]; then
-  echo "Could not find a python-build-standalone release for Python ${PYTHON_VERSION}" >&2
+echo "==> Fetching portable Python ${PYTHON_VERSION} via uv"
+export UV_PYTHON_INSTALL_DIR="${BUILD_DIR}/uv-python"
+uv python install "${PYTHON_VERSION}"
+
+PYROOT="$(find "${UV_PYTHON_INSTALL_DIR}" -maxdepth 1 -type d \
+  -name "cpython-${PYTHON_VERSION}.*-linux-x86_64-gnu*" | sort | tail -n1)"
+if [ -z "${PYROOT}" ]; then
+  echo "Could not locate an installed Python ${PYTHON_VERSION} under ${UV_PYTHON_INSTALL_DIR}" >&2
   exit 1
 fi
-echo "    using ${PBS_ASSET_URL}"
+echo "    using ${PYROOT}"
 
-curl -fsSL "${PBS_ASSET_URL}" -o /tmp/pbs-python.tar.gz
-tar -xzf /tmp/pbs-python.tar.gz -C "${APPDIR}/usr"
-mv "${APPDIR}/usr/python" "${APPDIR}/usr/pyruntime"
-rm -f /tmp/pbs-python.tar.gz
+cp -a "${PYROOT}" "${APPDIR}/usr/pyruntime"
 
+# The extracted binary may be named python3.X rather than python3; AppRun
+# always invokes .../bin/python3 explicitly, so make sure that name exists.
+if [ ! -e "${APPDIR}/usr/pyruntime/bin/python3" ]; then
+  REAL_PY="$(basename "$(ls "${APPDIR}/usr/pyruntime/bin"/python3.[0-9]* | head -n1)")"
+  ln -sf "${REAL_PY}" "${APPDIR}/usr/pyruntime/bin/python3"
+fi
 PYBIN="${APPDIR}/usr/pyruntime/bin/python3"
 
-# These builds don't always ship pip preinstalled; ensure it's there.
 "${PYBIN}" -m ensurepip --upgrade >/dev/null 2>&1 || true
 "${PYBIN}" -m pip install --upgrade pip wheel >/dev/null
 "${PYBIN}" -m pip install "wireviz==${WIREVIZ_VERSION}"
@@ -82,8 +92,8 @@ PYBIN="${APPDIR}/usr/pyruntime/bin/python3"
 # invokes the interpreter directly and explicitly (see below), so the
 # shebang recorded by pip at build time is never used at runtime and
 # doesn't matter either way. This whole usr/pyruntime directory is
-# self-contained and relocatable as-is; that's the point of using
-# python-build-standalone instead of the OS's Python.
+# self-contained and relocatable as-is; that's the point of using a
+# python-build-standalone-derived build instead of the OS's Python.
 
 # ---------------------------------------------------------------------------
 # 2. Bundle a Graphviz `dot` binary (WireViz's only non-Python dependency)

@@ -76,6 +76,13 @@ echo "    using ${PYROOT}"
 
 cp -a "${PYROOT}" "${APPDIR}/usr/pyruntime"
 
+# uv marks its managed interpreters as PEP 668 "externally managed" to
+# stop `pip install` from touching them directly. That protection is
+# for uv's own managed store; it's meaningless (and just gets in the
+# way) once we've copied the interpreter out into our own AppDir, so
+# drop the marker before installing wireviz into it.
+find "${APPDIR}/usr/pyruntime" -name 'EXTERNALLY-MANAGED' -delete
+
 # The extracted binary may be named python3.X rather than python3; AppRun
 # always invokes .../bin/python3 explicitly, so make sure that name exists.
 if [ ! -e "${APPDIR}/usr/pyruntime/bin/python3" ]; then

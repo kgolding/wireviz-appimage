@@ -43,17 +43,23 @@ mkdir -p "${APPDIR}/usr/bin" "${APPDIR}/usr/lib" "${APPDIR}/usr/share/applicatio
 # 1. Embedded Python venv with WireViz installed
 # ---------------------------------------------------------------------------
 echo "==> Creating embedded venv"
-python3 -m venv "${APPDIR}/usr/venv"
+# --copies: copy the actual python interpreter binary into the venv
+# instead of symlinking to the build machine's system python. Without
+# this, the AppImage silently depends on the *target* machine having a
+# python3 at the exact same absolute path the venv was built with.
+python3 -m venv --copies "${APPDIR}/usr/venv"
 # shellcheck disable=SC1091
 source "${APPDIR}/usr/venv/bin/activate"
 pip install --upgrade pip wheel >/dev/null
 pip install "wireviz==${WIREVIZ_VERSION}"
 deactivate
 
-# Make the venv relocatable: rewrite the shebang lines in venv/bin scripts
-# to a relative launcher instead of the absolute build-time path.
-find "${APPDIR}/usr/venv/bin" -maxdepth 1 -type f -exec \
-  sed -i "1s|^#!.*python.*|#!/usr/bin/env python3|" {} \;
+# NOTE: do NOT rewrite the shebang lines in usr/venv/bin/* to
+# `#!/usr/bin/env python3` — that makes them run against the *host*
+# system's Python (which doesn't have wireviz installed) instead of
+# this bundled venv. The venv's own interpreter is invoked directly
+# and explicitly in AppRun below, so the shebang line is never even
+# used at runtime; leave it as-is.
 
 # ---------------------------------------------------------------------------
 # 2. Bundle a Graphviz `dot` binary (WireViz's only non-Python dependency)
@@ -93,7 +99,10 @@ HERE="$(dirname "$(readlink -f "${0}")")"
 export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH:-}"
 export PATH="${HERE}/usr/bin:${HERE}/usr/venv/bin:${PATH}"
 export GVBINDIR="${HERE}/usr/lib/graphviz"
-exec "${HERE}/usr/venv/bin/wireviz" "$@"
+# Invoke the bundled venv's own interpreter explicitly (not via PATH or
+# the script's shebang) so it always uses the packaged wireviz install,
+# regardless of what Python is or isn't present on the host system.
+exec "${HERE}/usr/venv/bin/python3" "${HERE}/usr/venv/bin/wireviz" "$@"
 EOF
 chmod +x "${APPDIR}/AppRun"
 

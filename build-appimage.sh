@@ -142,7 +142,18 @@ chmod +x "${APPIMAGETOOL}"
 
 echo "==> Running appimagetool"
 OUTPUT_NAME="wireviz-0.41.AppImage"
-ARCH="${ARCH}" "${APPIMAGETOOL}" "${APPDIR}" "${BUILD_DIR}/${OUTPUT_NAME}"
+# appimagetool is itself an AppImage and needs FUSE to run normally.
+# Many CI runners (e.g. GitHub Actions) don't have FUSE available, so
+# fall back to --appimage-extract-and-run, which works everywhere.
+if ARCH="${ARCH}" "${APPIMAGETOOL}" "${APPDIR}" "${BUILD_DIR}/${OUTPUT_NAME}" 2>/tmp/appimagetool.err; then
+  :
+elif grep -q "libfuse" /tmp/appimagetool.err; then
+  echo "    FUSE not available, retrying with --appimage-extract-and-run"
+  ARCH="${ARCH}" "${APPIMAGETOOL}" --appimage-extract-and-run "${APPDIR}" "${BUILD_DIR}/${OUTPUT_NAME}"
+else
+  cat /tmp/appimagetool.err >&2
+  exit 1
+fi
 
 echo
 echo "==> Done: ${BUILD_DIR}/${OUTPUT_NAME}"

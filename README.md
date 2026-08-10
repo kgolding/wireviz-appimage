@@ -79,6 +79,19 @@ To use it:
 3. Optionally adjust the cron schedule or the base image
    (`ubuntu-22.04`) in the workflow to suit your compatibility needs.
 
+## Troubleshooting
+
+- **`dlopen(): error loading libfuse.so.2` / "AppImages require FUSE to
+  run"**: `appimagetool` is itself packaged as an AppImage, and many
+  systems (especially CI runners and minimal containers) don't have
+  FUSE installed. Fixes, in order of preference:
+  - `sudo apt-get install libfuse2` (Debian/Ubuntu) before running the
+    script, or the equivalent for your distro.
+  - If FUSE genuinely isn't available (e.g. some CI sandboxes), the
+    script now automatically retries with
+    `appimagetool --appimage-extract-and-run`, which works without
+    FUSE. You don't need to do anything — this fallback is built in.
+
 ## Notes / things you may want to tweak
 
 - **Icon**: the script generates a plain placeholder PNG so
